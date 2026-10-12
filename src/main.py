@@ -1,0 +1,186 @@
+import sys
+import time
+import asyncio
+import logging
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlencode
+
+import aiohttp
+import yaml
+
+BASE = Path(__file__).parent.parent
+CONFIG_PATH = BASE / "config.yaml"
+LOG_DIR = BASE / "logs"
+API = "https://cloud-api.yandex.net/v1/disk/resources"
+
+
+def setup_logging():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / f"download_{datetime.now():%Y%m%d_%H%M%S}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    return log_file
+
+
+def load_config():
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def yd_to_local(yd_path: str, download_dir: Path) -> Path:
+    rel = yd_path.replace("disk:/", "").lstrip("/")
+    return download_dir / rel
+
+
+class YDiskClient:
+    def __init__(self, token: str, session: aiohttp.ClientSession):
+        self.token = token
+        self.session = session
+
+    async def _get(self, endpoint: str, params: dict):
+        qs = urlencode(params)
+        base = API if endpoint == "/resources" else f"{API}{endpoint}"
+        url = f"{base}?{qs}"
+        headers = {"Authorization": f"OAuth {self.token}"}
+
+        for attempt in range(2):
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with self.session.get(url, headers=headers, timeout=timeout) as r:
+                    if r.status == 429:
+                        wait = int(r.headers.get("Retry-After", 3))
+                        logging.warning(f"rate-limit, wait {wait}s")
+                        await asyncio.sleep(wait)
+                        continue
+                    r.raise_for_status()
+                    return await r.json()
+            except asyncio.TimeoutError:
+                logging.warning(f"timeout attempt {attempt + 1}/2: {params.get('path', endpoint)}")
+                if attempt == 1:
+                    raise
+                await asyncio.sleep(1)
+            except aiohttp.ClientError as e:
+                logging.warning(f"network error attempt {attempt + 1}/2: {e}")
+                if attempt == 1:
+                    raise
+                await asyncio.sleep(1)
+
+    async def list_dir(self, path: str):
+        j = await self._get("/resources", {"path": path, "limit": 1000})
+        return j.get("_embedded", {}).get("items", [])
+
+    async def get_download_link(self, path: str):
+        j = await self._get("/resources/download", {"path": path})
+        return j["href"]
+
+    async def download(self, href: str, dest: Path):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        timeout = aiohttp.ClientTimeout(total=600, sock_connect=20, sock_read=60)
+        async with self.session.get(href, timeout=timeout) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                async for chunk in r.content.iter_chunked(1024 * 1024):
+                    f.write(chunk)
+
+
+async def main():
+    log_file = setup_logging()
+    logging.info(f"Log: {log_file}")
+
+    cfg = load_config()
+    token = cfg["token"]
+    download_dir = Path(cfg["download_dir"])
+
+    if not token or token == "REPLACE_WITH_YOUR_TOKEN":
+        logging.error("токен не задан")
+        sys.exit(1)
+
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        disk = YDiskClient(token, session)
+
+        # BFS scan (no recursion -> no stack overflow)
+        files = []
+        queue = ["disk:/"]
+        visited = set()
+        seen = set()
+
+        logging.info("scan...")
+        while queue:
+            batch = queue[:30]
+            queue = queue[30:]
+
+            async def fetch_one(p):
+                if p in seen:
+                    return []
+                seen.add(p)
+                try:
+                    return await disk.list_dir(p)
+                except Exception as e:
+                    logging.error(f"listdir {p}: {e}")
+                    return []
+
+            results = await asyncio.gather(*[fetch_one(p) for p in batch])
+
+            for items in results:
+                for it in items:
+                    p = it.get("path")
+                    if it.get("type") == "dir":
+                        if p not in visited:
+                            visited.add(p)
+                            queue.append(p)
+                    else:
+                        files.append(it)
+
+        total = len(files)
+        logging.info(f"files: {total}")
+
+        ok = 0
+        skipped = 0
+        errors = []
+        sem = asyncio.Semaphore(3)
+
+        async def process(f):
+            nonlocal ok, skipped
+            dest = yd_to_local(f["path"], download_dir)
+            size = f.get("size") or 0
+            size_mb = size / 1048576
+
+            if dest.exists() and dest.stat().st_size == size:
+                skipped += 1
+                logging.info(f"[SKIP] {f.get('name')} ({size_mb:.1f} MB)")
+                return
+
+            async with sem:
+                try:
+                    logging.info(f"[GET ] {f.get('name')} ({size_mb:.1f} MB)")
+                    href = await disk.get_download_link(f["path"])
+                    t0 = time.time()
+                    await disk.download(href, dest)
+                    dt = time.time() - t0
+                    speed = size_mb / dt if dt > 0 and size_mb > 0 else 0
+                    ok += 1
+                    logging.info(f"[OK  ] {f.get('name')} {dt:.1f}s {speed:.1f} MB/s")
+                except Exception as e:
+                    errors.append((f.get("path"), str(e)))
+                    logging.error(f"[FAIL] {f.get('name')}: {e}")
+
+        await asyncio.gather(*[process(f) for f in files])
+
+    logging.info("=" * 60)
+    logging.info(f"DONE: {ok} ok, {skipped} skip, {len(errors)} fail")
+    for p, e in errors:
+        logging.info(f"  {p}: {e}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

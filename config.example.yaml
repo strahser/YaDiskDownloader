@@ -1,0 +1,5 @@
+token: "REPLACE_WITH_YOUR_TOKEN"
+download_dir: "d:\\YandexProjects"
+log_dir: "d:\\Projects\\YaDiskDownloader\\logs"
+chunk_size: 1048576
+max_retries: 5
