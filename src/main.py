@@ -69,9 +69,12 @@ def yd_to_local(yd_path: str, download_dir: Path) -> Path:
 
 
 class YDiskClient:
-    def __init__(self, token: str, session: aiohttp.ClientSession):
+    def __init__(self, token: str, session: aiohttp.ClientSession, dl_session: aiohttp.ClientSession = None):
         self.token = token
         self.session = session
+        # Отдельная сессия для скачивания: долгие загрузки больших файлов
+        # не должны отъедать коннекты у быстрых API-запросов сканирования.
+        self.dl_session = dl_session or session
 
     async def _request(self, method: str, endpoint: str, params: dict = None) -> dict:
         qs = urlencode(params) if params else ""
@@ -140,8 +143,9 @@ class YDiskClient:
                 logging.info(f"[RESUME] {dest.name} с {downloaded_size} байт (попытка {attempt + 1})")
 
             try:
-                timeout = aiohttp.ClientTimeout(total=3600, sock_connect=20, sock_read=120)
-                async with self.session.get(href, headers=headers, timeout=timeout) as r:
+                timeout = aiohttp.ClientTimeout(total=7200, sock_connect=30, sock_read=300)
+                written = 0
+                async with self.dl_session.get(href, headers=headers, timeout=timeout) as r:
                     if downloaded_size > 0 and r.status == 200:
                         logging.warning(f"Сервер игнорирует Range, перезапуск {dest.name}")
                         downloaded_size = 0
@@ -153,9 +157,13 @@ class YDiskClient:
                     with open(dest, mode) as f:
                         async for chunk in r.content.iter_chunked(1024 * 1024):
                             f.write(chunk)
+                            written += len(chunk)
                     return True
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logging.warning(f"Ошибка скачивания (попытка {attempt + 1}/{MAX_RETRIES}) {dest.name}: {e}")
+                logging.warning(
+                    f"Ошибка скачивания (попытка {attempt + 1}/{MAX_RETRIES}) {dest.name}: {e} "
+                    f"(в этой попытке получено {written / 1048576:.1f} МБ)"
+                )
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(2 ** attempt)
                 else:
@@ -268,9 +276,11 @@ async def main():
 
     download_dir.mkdir(parents=True, exist_ok=True)
 
-    connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        disk = YDiskClient(token, session)
+    connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
+    dl_connector = aiohttp.TCPConnector(limit=CONCURRENT_DOWNLOADS + 1, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session, \
+               aiohttp.ClientSession(connector=dl_connector) as dl_session:
+        disk = YDiskClient(token, session, dl_session)
 
         try:
             info = await disk.disk_info()
