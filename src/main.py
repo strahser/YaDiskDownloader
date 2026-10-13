@@ -19,9 +19,13 @@ BASE = Path(__file__).parent.parent
 CONFIG_PATH = BASE / "config.yaml"
 LOG_DIR = BASE / "logs"
 API_BASE = "https://cloud-api.yandex.net/v1/disk"
-CONCURRENT_DOWNLOADS = 3
+CONCURRENT_DOWNLOADS = 2
 MAX_RETRIES = 5
 QUEUE_MAXSIZE = 1000
+# Пауза перед стартом новой загрузки, если недавно была сетевая ошибка
+# (storage Яндекса начинает капать новые соединения при агрессивном потоке).
+COOLDOWN_AFTER_FAIL = 30.0
+_dl_state = {"last_fail": 0.0}
 
 
 def setup_environment():
@@ -144,7 +148,7 @@ class YDiskClient:
                 logging.info(f"[RESUME] {dest.name} с {downloaded_size} байт (попытка {attempt + 1})")
 
             try:
-                timeout = aiohttp.ClientTimeout(total=7200, sock_connect=30, sock_read=300)
+                timeout = aiohttp.ClientTimeout(total=7200, sock_connect=30, sock_read=120)
                 written = 0
                 async with self.dl_session.get(href, headers=headers, timeout=timeout) as r:
                     if downloaded_size > 0 and r.status == 200:
@@ -161,6 +165,7 @@ class YDiskClient:
                             written += len(chunk)
                     return True
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                _dl_state["last_fail"] = time.monotonic()
                 logging.warning(
                     f"Ошибка скачивания (попытка {attempt + 1}/{MAX_RETRIES}) {dest.name}: {e} "
                     f"(в этой попытке получено {written / 1048576:.1f} МБ)"
@@ -254,10 +259,17 @@ async def worker(
         if f is None:
             queue.task_done()
             break
+        # Джентльменская пауза после недавних ошибок: не долбим storage,
+        # иначе он начинает подвешивать новые соединения.
+        now = time.monotonic()
+        wait = COOLDOWN_AFTER_FAIL - (now - _dl_state["last_fail"])
+        if wait > 0:
+            await asyncio.sleep(wait)
         try:
             r = await fetch_file(disk, f, download_dir)
             stats[r] += 1
         except Exception as e:
+            _dl_state["last_fail"] = time.monotonic()
             errors.append((f, str(e)))
             logging.error(f"[FAIL] {f.get('name')}: {e}")
         finally:
