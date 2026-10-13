@@ -121,26 +121,26 @@ class YDiskClient:
     async def download_file(self, href: str, dest: Path, total_size: int) -> bool:
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        if dest.exists() and dest.stat().st_size == total_size:
-            return True
-
-        downloaded_size = 0
-        mode = "wb"
-        if dest.exists():
-            downloaded_size = dest.stat().st_size
-            if downloaded_size < total_size:
-                mode = "ab"
-            else:
-                return True
-
-        headers = {}
-        if downloaded_size > 0:
-            headers["Range"] = f"bytes={downloaded_size}-"
-            logging.info(f"[RESUME] {dest.name} с {downloaded_size} байт")
-
         for attempt in range(MAX_RETRIES):
+            # Точку resume пересчитываем КАЖДУЮ попытку: прошлая могла
+            # успеть дописать часть файла до обрыва.
+            downloaded_size = 0
+            mode = "wb"
+            if dest.exists():
+                cur = dest.stat().st_size
+                if cur == total_size:
+                    return True
+                if 0 < cur < total_size:
+                    downloaded_size = cur
+                    mode = "ab"
+
+            headers = {}
+            if downloaded_size > 0:
+                headers["Range"] = f"bytes={downloaded_size}-"
+                logging.info(f"[RESUME] {dest.name} с {downloaded_size} байт (попытка {attempt + 1})")
+
             try:
-                timeout = aiohttp.ClientTimeout(total=3600, sock_connect=20, sock_read=60)
+                timeout = aiohttp.ClientTimeout(total=3600, sock_connect=20, sock_read=120)
                 async with self.session.get(href, headers=headers, timeout=timeout) as r:
                     if downloaded_size > 0 and r.status == 200:
                         logging.warning(f"Сервер игнорирует Range, перезапуск {dest.name}")
@@ -149,6 +149,7 @@ class YDiskClient:
                     elif r.status not in (200, 206):
                         r.raise_for_status()
 
+                    # При повторе после ignore-Range открываем заново в wb
                     with open(dest, mode) as f:
                         async for chunk in r.content.iter_chunked(1024 * 1024):
                             f.write(chunk)
