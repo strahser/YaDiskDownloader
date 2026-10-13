@@ -3,6 +3,7 @@ import sys
 import re
 import time
 import asyncio
+import itertools
 import logging
 import shutil
 from pathlib import Path
@@ -195,13 +196,16 @@ async def fetch_file(disk: YDiskClient, f: Dict[str, Any], download_dir: Path) -
 
 async def scan_and_queue(
     disk: YDiskClient,
-    queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
+    queue: "asyncio.PriorityQueue",
     workers: int,
 ) -> Tuple[int, int]:
     """BFS-обход: файлы сразу кладутся в очередь на скачивание.
+    Приоритет — мелкие файлы первыми, чтобы гигабайтные «холодные»
+    файлы не блокировали поток (head-of-line blocking).
     Возвращает (папок_просканировано, файлов_найдено)."""
     pending = ["disk:/"]
     visited = {"disk:/"}
+    seq = itertools.count()
     scanned = 0
     found = 0
     t0 = time.time()
@@ -228,25 +232,25 @@ async def scan_and_queue(
                         pending.append(p)
                 else:
                     found += 1
-                    await queue.put(it)
+                    await queue.put((it.get("size") or 0, next(seq), it))
         if scanned % 90 == 0 or not pending:
             logging.info(f"Скан: папок={scanned} файлов_в_работе={found} очередь_папок={len(pending)} {time.time() - t0:.0f}с")
     logging.info(f"Сканирование готово: папок={scanned} файлов={found} за {time.time() - t0:.0f}с")
     for _ in range(workers):
-        await queue.put(None)
+        await queue.put((2 ** 62, next(seq), None))
     return scanned, found
 
 
 async def worker(
     disk: YDiskClient,
-    queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
+    queue: "asyncio.PriorityQueue",
     download_dir: Path,
     stats: Dict[str, int],
     errors: List[Tuple[Dict, str]],
     pbar: tqdm,
 ):
     while True:
-        f = await queue.get()
+        _, _, f = await queue.get()
         if f is None:
             queue.task_done()
             break
@@ -292,7 +296,7 @@ async def main():
         except Exception as e:
             logging.warning(f"Не удалось получить инфо диска: {e}")
 
-        queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+        queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=QUEUE_MAXSIZE)
         stats = {"ok": 0, "skipped": 0}
         errors: List[Tuple[Dict, str]] = []
 
