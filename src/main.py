@@ -163,6 +163,8 @@ async def scan_disk(disk: YDiskClient) -> List[Dict[str, Any]]:
     queue = ["disk:/"]
     visited = {"disk:/"}
     logging.info("Сканирование диска...")
+    scanned = 0
+    t0 = time.time()
     while queue:
         batch = queue[:30]
         queue = queue[30:]
@@ -175,6 +177,7 @@ async def scan_disk(disk: YDiskClient) -> List[Dict[str, Any]]:
                 return []
 
         results = await asyncio.gather(*[fetch_one(p) for p in batch])
+        scanned += len(batch)
         for items in results:
             for it in items:
                 p = it.get("path")
@@ -184,6 +187,9 @@ async def scan_disk(disk: YDiskClient) -> List[Dict[str, Any]]:
                         queue.append(p)
                 else:
                     files.append(it)
+        if scanned % 90 == 0 or not queue:
+            logging.info(f"Скан: папок={scanned} файлов={len(files)} очередь={len(queue)} {time.time() - t0:.0f}с")
+    logging.info(f"Сканирование готово: папок={scanned} файлов={len(files)} за {time.time() - t0:.0f}с")
     return files
 
 
