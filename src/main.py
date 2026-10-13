@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlencode, unquote
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import aiohttp
 import yaml
@@ -20,6 +20,7 @@ LOG_DIR = BASE / "logs"
 API_BASE = "https://cloud-api.yandex.net/v1/disk"
 CONCURRENT_DOWNLOADS = 3
 MAX_RETRIES = 5
+QUEUE_MAXSIZE = 1000
 
 
 def setup_environment():
@@ -95,6 +96,9 @@ class YDiskClient:
                 await asyncio.sleep(2 ** attempt)
         return {}
 
+    async def disk_info(self) -> dict:
+        return await self._request("GET", "", None)
+
     async def list_dir(self, path: str) -> List[Dict[str, Any]]:
         items = []
         offset = 0
@@ -158,16 +162,44 @@ class YDiskClient:
         return False
 
 
-async def scan_disk(disk: YDiskClient) -> List[Dict[str, Any]]:
-    files = []
-    queue = ["disk:/"]
-    visited = {"disk:/"}
-    logging.info("Сканирование диска...")
-    scanned = 0
+async def fetch_file(disk: YDiskClient, f: Dict[str, Any], download_dir: Path) -> str:
+    """Скачать один файл. Возвращает 'ok' / 'skipped', при ошибке — исключение."""
+    dest = yd_to_local(f["path"], download_dir)
+    size = f.get("size") or 0
+
+    if dest.exists() and dest.stat().st_size == size:
+        return "skipped"
+
+    href = await disk.get_download_link(f["path"])
+    if not href:
+        raise ValueError("Пустая ссылка на скачивание")
+
     t0 = time.time()
-    while queue:
-        batch = queue[:30]
-        queue = queue[30:]
+    await disk.download_file(href, dest, size)
+    dt = time.time() - t0
+
+    size_mb = size / 1048576
+    speed = size_mb / dt if dt > 0 and size_mb > 0 else 0
+    logging.info(f"[OK  ] {f.get('name')} {dt:.1f}s {speed:.1f} MB/s")
+    return "ok"
+
+
+async def scan_and_queue(
+    disk: YDiskClient,
+    queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
+    workers: int,
+) -> Tuple[int, int]:
+    """BFS-обход: файлы сразу кладутся в очередь на скачивание.
+    Возвращает (папок_просканировано, файлов_найдено)."""
+    pending = ["disk:/"]
+    visited = {"disk:/"}
+    scanned = 0
+    found = 0
+    t0 = time.time()
+    logging.info("Сканирование диска (файлы качаются по ходу)...")
+    while pending:
+        batch = pending[:30]
+        pending = pending[30:]
 
         async def fetch_one(p: str):
             try:
@@ -184,47 +216,40 @@ async def scan_disk(disk: YDiskClient) -> List[Dict[str, Any]]:
                 if it.get("type") == "dir":
                     if p not in visited:
                         visited.add(p)
-                        queue.append(p)
+                        pending.append(p)
                 else:
-                    files.append(it)
-        if scanned % 90 == 0 or not queue:
-            logging.info(f"Скан: папок={scanned} файлов={len(files)} очередь={len(queue)} {time.time() - t0:.0f}с")
-    logging.info(f"Сканирование готово: папок={scanned} файлов={len(files)} за {time.time() - t0:.0f}с")
-    return files
+                    found += 1
+                    await queue.put(it)
+        if scanned % 90 == 0 or not pending:
+            logging.info(f"Скан: папок={scanned} файлов_в_работе={found} очередь_папок={len(pending)} {time.time() - t0:.0f}с")
+    logging.info(f"Сканирование готово: папок={scanned} файлов={found} за {time.time() - t0:.0f}с")
+    for _ in range(workers):
+        await queue.put(None)
+    return scanned, found
 
 
-async def process_file(
+async def worker(
     disk: YDiskClient,
-    f: Dict[str, Any],
+    queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
     download_dir: Path,
-    sem: asyncio.Semaphore,
     stats: Dict[str, int],
     errors: List[Tuple[Dict, str]],
+    pbar: tqdm,
 ):
-    dest = yd_to_local(f["path"], download_dir)
-    size = f.get("size") or 0
-
-    if dest.exists() and dest.stat().st_size == size:
-        stats["skipped"] += 1
-        return
-
-    async with sem:
+    while True:
+        f = await queue.get()
+        if f is None:
+            queue.task_done()
+            break
         try:
-            href = await disk.get_download_link(f["path"])
-            if not href:
-                raise ValueError("Пустая ссылка на скачивание")
-
-            t0 = time.time()
-            await disk.download_file(href, dest, size)
-            dt = time.time() - t0
-
-            size_mb = size / 1048576
-            speed = size_mb / dt if dt > 0 and size_mb > 0 else 0
-            stats["ok"] += 1
-            logging.info(f"[OK  ] {f.get('name')} {dt:.1f}s {speed:.1f} MB/s")
+            r = await fetch_file(disk, f, download_dir)
+            stats[r] += 1
         except Exception as e:
             errors.append((f, str(e)))
             logging.error(f"[FAIL] {f.get('name')}: {e}")
+        finally:
+            pbar.update(1)
+            queue.task_done()
 
 
 async def main():
@@ -246,42 +271,42 @@ async def main():
     async with aiohttp.ClientSession(connector=connector) as session:
         disk = YDiskClient(token, session)
 
-        files = await scan_disk(disk)
-        total_files = len(files)
-        logging.info(f"Найдено файлов для обработки: {total_files}")
+        try:
+            info = await disk.disk_info()
+            need = info.get("used_space", 0)
+            free = shutil.disk_usage(download_dir).free
+            logging.info(f"Диск: user={info.get('user', {}).get('login')} занято={need / 1024**3:.1f} GB, свободно локально={free / 1024**3:.1f} GB")
+            if free < need:
+                logging.warning("Места может не хватить на всё содержимое диска!")
+        except Exception as e:
+            logging.warning(f"Не удалось получить инфо диска: {e}")
 
-        total_size_needed = sum(
-            f.get("size", 0) for f in files
-            if not (yd_to_local(f["path"], download_dir).exists() and
-                    yd_to_local(f["path"], download_dir).stat().st_size == f.get("size", 0))
-        )
-        free_space = shutil.disk_usage(download_dir).free
-        if free_space < total_size_needed:
-            logging.warning(
-                f"ВНИМАНИЕ: Недостаточно места! Требуется: {total_size_needed / 1024**3:.2f} GB, "
-                f"Доступно: {free_space / 1024**3:.2f} GB"
-            )
-
+        queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
         stats = {"ok": 0, "skipped": 0}
-        errors = []
-        sem = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
-        tasks = [process_file(disk, f, download_dir, sem, stats, errors) for f in files]
+        errors: List[Tuple[Dict, str]] = []
 
-        with tqdm(total=total_files, desc="Скачивание", unit="файл") as pbar:
-            async def track_task(task):
-                await task
-                pbar.update(1)
-            await asyncio.gather(*[track_task(t) for t in tasks])
+        with tqdm(desc="Скачивание", unit="файл") as pbar:
+            workers = [
+                asyncio.create_task(worker(disk, queue, download_dir, stats, errors, pbar))
+                for _ in range(CONCURRENT_DOWNLOADS)
+            ]
+            scanned, found = await scan_and_queue(disk, queue, CONCURRENT_DOWNLOADS)
+            pbar.total = found
+            pbar.refresh()
+            await asyncio.gather(*workers)
 
         final_errors: List[Tuple[Dict, str]] = []
         if errors:
             logging.info(f"=== ФИНАЛЬНЫЙ ПОВТОР ({len(errors)} файлов) ===")
-            retry_tasks = [process_file(disk, f, download_dir, sem, stats, final_errors) for f, _ in errors]
             with tqdm(total=len(errors), desc="Повтор", unit="файл") as pbar:
-                async def track_retry(task):
-                    await task
+                for f, _ in errors:
+                    try:
+                        r = await fetch_file(disk, f, download_dir)
+                        stats[r] += 1
+                    except Exception as e:
+                        final_errors.append((f, str(e)))
+                        logging.error(f"[FAIL] {f.get('name')}: {e}")
                     pbar.update(1)
-                await asyncio.gather(*[track_retry(t) for t in retry_tasks])
 
             if final_errors:
                 logging.error(f"Не удалось скачать {len(final_errors)} файлов после повтора:")
@@ -290,7 +315,7 @@ async def main():
 
         failed_count = len(final_errors) if errors else 0
         logging.info("=" * 60)
-        logging.info(f"ИТОГО: {stats['ok']} успешно, {stats['skipped']} пропущено, {failed_count} ошибок")
+        logging.info(f"ИТОГО: папок={scanned} {stats['ok']} успешно, {stats['skipped']} пропущено, {failed_count} ошибок")
 
 
 if __name__ == "__main__":
