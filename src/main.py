@@ -203,18 +203,20 @@ async def scan_and_queue(
     disk: YDiskClient,
     queue: "asyncio.PriorityQueue",
     workers: int,
+    roots: List[str],
 ) -> Tuple[int, int]:
     """BFS-обход: файлы сразу кладутся в очередь на скачивание.
     Приоритет — мелкие файлы первыми, чтобы гигабайтные «холодные»
     файлы не блокировали поток (head-of-line blocking).
     Возвращает (папок_просканировано, файлов_найдено)."""
-    pending = ["disk:/"]
-    visited = {"disk:/"}
+    pending = list(roots)
+    visited = set(roots)
     seq = itertools.count()
     scanned = 0
     found = 0
     t0 = time.time()
     logging.info("Сканирование диска (файлы качаются по ходу)...")
+    logging.info(f"Корни обхода: {roots}")
     while pending:
         batch = pending[:30]
         pending = pending[30:]
@@ -291,6 +293,7 @@ async def main():
         sys.exit(1)
 
     download_dir.mkdir(parents=True, exist_ok=True)
+    roots = cfg.get("roots") or ["disk:/"]
 
     connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
     dl_connector = aiohttp.TCPConnector(limit=CONCURRENT_DOWNLOADS + 1, ttl_dns_cache=300)
@@ -317,7 +320,7 @@ async def main():
                 asyncio.create_task(worker(disk, queue, download_dir, stats, errors, pbar))
                 for _ in range(CONCURRENT_DOWNLOADS)
             ]
-            scanned, found = await scan_and_queue(disk, queue, CONCURRENT_DOWNLOADS)
+            scanned, found = await scan_and_queue(disk, queue, CONCURRENT_DOWNLOADS, roots)
             pbar.total = found
             pbar.refresh()
             await asyncio.gather(*workers)
