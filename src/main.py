@@ -20,7 +20,7 @@ CONFIG_PATH = BASE / "config.yaml"
 LOG_DIR = BASE / "logs"
 API_BASE = "https://cloud-api.yandex.net/v1/disk"
 CONCURRENT_DOWNLOADS = 2
-MAX_RETRIES = 5
+MAX_RETRIES = 2
 QUEUE_MAXSIZE = 1000
 # Пауза перед стартом новой загрузки, если недавно была сетевая ошибка
 # (storage Яндекса начинает капать новые соединения при агрессивном потоке).
@@ -148,7 +148,7 @@ class YDiskClient:
                 logging.info(f"[RESUME] {dest.name} с {downloaded_size} байт (попытка {attempt + 1})")
 
             try:
-                timeout = aiohttp.ClientTimeout(total=7200, sock_connect=30, sock_read=120)
+                timeout = aiohttp.ClientTimeout(total=3600, sock_connect=20, sock_read=60)
                 written = 0
                 async with self.dl_session.get(href, headers=headers, timeout=timeout) as r:
                     if downloaded_size > 0 and r.status == 200:
