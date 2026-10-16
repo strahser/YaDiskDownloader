@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import sys
+import os
 import re
 import time
 import asyncio
@@ -16,7 +17,7 @@ import yaml
 from tqdm import tqdm
 
 BASE = Path(__file__).parent.parent
-CONFIG_PATH = BASE / "config.yaml"
+CONFIG_PATH = Path(os.environ.get("YADISK_CONFIG", BASE / "config.yaml"))
 LOG_DIR = BASE / "logs"
 API_BASE = "https://cloud-api.yandex.net/v1/disk"
 CONCURRENT_DOWNLOADS = 3
@@ -303,9 +304,11 @@ async def main():
     download_dir.mkdir(parents=True, exist_ok=True)
     roots = cfg.get("roots") or ["disk:/"]
     priority = cfg.get("priority") or []
+    num_workers = int(cfg.get("workers", CONCURRENT_DOWNLOADS))
+    priority = cfg.get("priority") or []
 
     connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
-    dl_connector = aiohttp.TCPConnector(limit=CONCURRENT_DOWNLOADS + 1, ttl_dns_cache=300)
+    dl_connector = aiohttp.TCPConnector(limit=num_workers + 1, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session, \
                aiohttp.ClientSession(connector=dl_connector) as dl_session:
         disk = YDiskClient(token, session, dl_session)
@@ -327,9 +330,9 @@ async def main():
         with tqdm(desc="Скачивание", unit="файл") as pbar:
             workers = [
                 asyncio.create_task(worker(disk, queue, download_dir, stats, errors, pbar))
-                for _ in range(CONCURRENT_DOWNLOADS)
+                for _ in range(num_workers)
             ]
-            scanned, found = await scan_and_queue(disk, queue, CONCURRENT_DOWNLOADS, roots, priority)
+            scanned, found = await scan_and_queue(disk, queue, num_workers, roots, priority)
             pbar.total = found
             pbar.refresh()
             await asyncio.gather(*workers)
