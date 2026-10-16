@@ -19,7 +19,7 @@ BASE = Path(__file__).parent.parent
 CONFIG_PATH = BASE / "config.yaml"
 LOG_DIR = BASE / "logs"
 API_BASE = "https://cloud-api.yandex.net/v1/disk"
-CONCURRENT_DOWNLOADS = 2
+CONCURRENT_DOWNLOADS = 3
 MAX_RETRIES = 2
 QUEUE_MAXSIZE = 1000
 # Пауза перед стартом новой загрузки, если недавно была сетевая ошибка
@@ -204,13 +204,21 @@ async def scan_and_queue(
     queue: "asyncio.PriorityQueue",
     workers: int,
     roots: List[str],
+    priority: List[str] = None,
 ) -> Tuple[int, int]:
     """BFS-обход: файлы сразу кладутся в очередь на скачивание.
-    Приоритет — мелкие файлы первыми, чтобы гигабайтные «холодные»
-    файлы не блокировали поток (head-of-line blocking).
+    Приоритет: сначала priority-папки, внутри — мелкие файлы первыми,
+    чтобы гигабайтные «холодные» файлы не блокировали поток.
     Возвращает (папок_просканировано, файлов_найдено)."""
     pending = list(roots)
     visited = set(roots)
+    prio = priority or []
+
+    def prio_of(p: str) -> int:
+        for pr in prio:
+            if p == pr or p.startswith(pr + "/"):
+                return 0
+        return 1
     seq = itertools.count()
     scanned = 0
     found = 0
@@ -239,12 +247,12 @@ async def scan_and_queue(
                         pending.append(p)
                 else:
                     found += 1
-                    await queue.put((it.get("size") or 0, next(seq), it))
+                    await queue.put((prio_of(it["path"]), it.get("size") or 0, next(seq), it))
         if scanned % 90 == 0 or not pending:
             logging.info(f"Скан: папок={scanned} файлов_в_работе={found} очередь_папок={len(pending)} {time.time() - t0:.0f}с")
     logging.info(f"Сканирование готово: папок={scanned} файлов={found} за {time.time() - t0:.0f}с")
     for _ in range(workers):
-        await queue.put((2 ** 62, next(seq), None))
+        await queue.put((2 ** 62, 2 ** 62, next(seq), None))
     return scanned, found
 
 
@@ -257,7 +265,7 @@ async def worker(
     pbar: tqdm,
 ):
     while True:
-        _, _, f = await queue.get()
+        _, _, _, f = await queue.get()
         if f is None:
             queue.task_done()
             break
@@ -294,6 +302,7 @@ async def main():
 
     download_dir.mkdir(parents=True, exist_ok=True)
     roots = cfg.get("roots") or ["disk:/"]
+    priority = cfg.get("priority") or []
 
     connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
     dl_connector = aiohttp.TCPConnector(limit=CONCURRENT_DOWNLOADS + 1, ttl_dns_cache=300)
@@ -320,7 +329,7 @@ async def main():
                 asyncio.create_task(worker(disk, queue, download_dir, stats, errors, pbar))
                 for _ in range(CONCURRENT_DOWNLOADS)
             ]
-            scanned, found = await scan_and_queue(disk, queue, CONCURRENT_DOWNLOADS, roots)
+            scanned, found = await scan_and_queue(disk, queue, CONCURRENT_DOWNLOADS, roots, priority)
             pbar.total = found
             pbar.refresh()
             await asyncio.gather(*workers)
