@@ -9,8 +9,7 @@ foreach ($c in @('config-k1.yaml', 'config-m1.yaml')) {
         WLog ('OK ' + $c + ' pid=' + (($run | Select-Object -ExpandProperty ProcessId) -join ','))
     } else {
         WLog ($c + ' NOT RUNNING -> restart')
-        $env:YADISK_CONFIG = Join-Path $Repo $c
-        Start-Process -FilePath $py -ArgumentList '-u', 'src\main.py' -WorkingDirectory $Repo
+        Start-Process -FilePath $py -ArgumentList '-u', 'src\main.py', '--config', $c -WorkingDirectory $Repo
         WLog ('restart issued ' + $c)
     }
 }

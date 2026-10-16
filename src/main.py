@@ -17,7 +17,19 @@ import yaml
 from tqdm import tqdm
 
 BASE = Path(__file__).parent.parent
-CONFIG_PATH = Path(os.environ.get("YADISK_CONFIG", BASE / "config.yaml"))
+
+
+def _config_path() -> Path:
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--config", default=None)
+    args, _ = ap.parse_known_args()
+    if args.config:
+        return Path(args.config)
+    return Path(os.environ.get("YADISK_CONFIG", BASE / "config.yaml"))
+
+
+CONFIG_PATH = _config_path()
 LOG_DIR = BASE / "logs"
 API_BASE = "https://cloud-api.yandex.net/v1/disk"
 CONCURRENT_DOWNLOADS = 3
