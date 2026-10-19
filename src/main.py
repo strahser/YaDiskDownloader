@@ -5,6 +5,7 @@ import re
 import time
 import asyncio
 import itertools
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -37,14 +38,31 @@ MAX_RETRIES = 2
 QUEUE_MAXSIZE = 1000
 # Пауза перед стартом новой загрузки, если недавно была сетевая ошибка
 # (storage Яндекса начинает капать новые соединения при агрессивном потоке).
-COOLDOWN_AFTER_FAIL = 30.0
+COOLDOWN_AFTER_FAIL = 10.0
+# «Мёртвые» файлы: Яндекс их не отдаёт (таймаут сокета / ContentLengthError).
+# Один такой файл стоит ~40 с (две попытки + пауза), а проходов много — поэтому
+# запоминаем их и пропускаем на DEAD_TTL_HOURS, после чего пробуем снова.
+DEAD_TTL_HOURS = 12.0
+# Эталонный (заведомо скачанный) файл: по нему проверяем, жива ли сеть, когда
+# проход не дал ни одного успеха. Если канарейка не проходит — это обрыв сети,
+# и метки «мёртвых» файлов надо снять, иначе просидим на них полдня.
+CANARY_STATE_PATH = LOG_DIR / f"canary_{CONFIG_PATH.stem}.json"
+# Сколько отказов нужно, чтобы считать файл мёртвым: две попытки уже делает
+# download_file, поэтому одного [FAIL] достаточно.
+DEAD_AFTER_FAILS = 1
+# Файл помечается мёртвым, только если рядом было успешное скачивание: иначе
+# при общем обрыве сети мы бы «похоронили» весь диск на несколько часов.
+DEAD_CONFIRM_WINDOW = 600.0
+DEAD_STATE_PATH = LOG_DIR / f"dead_{CONFIG_PATH.stem}.json"
 # Цикловой режим: максимальная пауза между проходами (2 часа, как договаривались).
 MAX_IDLE_SLEEP = 7200.0
 # Сторож зависаний: если столько минут подряд в проходе не было ни одной попытки,
 # считаем процесс зависшим и выходим — внешний сторож поднимет его заново.
 HANG_TIMEOUT_MINUTES = 20
 _dl_state = {"last_fail": 0.0}
-_state = {"active": False, "last": 0.0}
+_state = {"active": False, "last": 0.0, "last_ok": 0.0}
+_dead: Dict[str, Dict[str, float]] = {}
+_dead_dirty = 0
 
 
 def touch_activity():
@@ -90,6 +108,103 @@ def setup_logging() -> Path:
 def load_config() -> Dict[str, Any]:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+# ---------- кэш «мёртвых» файлов ----------
+
+def load_dead() -> None:
+    global _dead
+    try:
+        if DEAD_STATE_PATH.exists():
+            raw = json.loads(DEAD_STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                _dead = {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+        logging.info(f"Кэш мёртвых файлов: {len(_dead)} записей ({DEAD_STATE_PATH.name})")
+    except Exception as e:
+        logging.warning(f"Не удалось прочитать кэш мёртвых файлов: {e}")
+
+
+def save_dead(force: bool = False) -> None:
+    global _dead_dirty
+    if not force and not _dead_dirty:
+        return
+    if force and not _dead_dirty and DEAD_STATE_PATH.exists():
+        return
+    try:
+        # Чистим давно просроченные записи, чтобы файл не рос бесконечно.
+        cutoff = time.time() - DEAD_TTL_HOURS * 3600 * 4
+        fresh = {k: v for k, v in _dead.items() if float(v.get("t", 0)) >= cutoff}
+        tmp = DEAD_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(fresh, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, DEAD_STATE_PATH)
+        _dead_dirty = 0
+    except Exception as e:
+        logging.warning(f"Не удалось сохранить кэш мёртвых файлов: {e}")
+
+
+def is_dead(path: str) -> bool:
+    v = _dead.get(path)
+    if not v:
+        return False
+    if int(v.get("n", 0)) < DEAD_AFTER_FAILS:
+        return False
+    return (time.time() - float(v.get("t", 0))) < DEAD_TTL_HOURS * 3600
+
+
+def mark_dead(path: str) -> None:
+    """Запомнить файл как мёртвый.
+
+    «Подтверждённой» (c=1) считаем метку, если рядом было успешное скачивание,
+    то есть сервер отдаёт другие файлы. Неподтверждённые метки снимаются, если
+    канарейка показала общий обрыв сети.
+    """
+    global _dead_dirty
+    last_ok = _state.get("last_ok") or 0.0
+    confirmed = 1 if (last_ok and (time.monotonic() - last_ok) <= DEAD_CONFIRM_WINDOW) else 0
+    v = _dead.setdefault(path, {"n": 0, "t": 0.0, "c": 0})
+    v["n"] = int(v.get("n", 0)) + 1
+    v["t"] = time.time()
+    v["c"] = max(int(v.get("c", 0)), confirmed)
+    _dead_dirty += 1
+    save_dead()
+
+
+def purge_unconfirmed() -> int:
+    """Снять метки, поставленные без подтверждения (при общем обрыве сети)."""
+    global _dead_dirty
+    bad = [k for k, v in _dead.items() if int(v.get("c", 0)) == 0]
+    for k in bad:
+        _dead.pop(k, None)
+    if bad:
+        _dead_dirty += len(bad)
+        save_dead(force=True)
+    return len(bad)
+
+
+def load_canary() -> None:
+    try:
+        if CANARY_STATE_PATH.exists():
+            j = json.loads(CANARY_STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(j, dict) and j.get("path"):
+                _state["canary"] = {"path": str(j["path"]), "size": int(j.get("size") or 0)}
+    except Exception as e:
+        logging.warning(f"Не удалось прочитать эталонный файл: {e}")
+
+
+def save_canary() -> None:
+    try:
+        if _state.get("canary"):
+            CANARY_STATE_PATH.write_text(
+                json.dumps(_state["canary"], ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logging.warning(f"Не удалось сохранить эталонный файл: {e}")
+
+
+def clear_dead(path: str) -> None:
+    global _dead_dirty
+    if _dead.pop(path, None) is not None:
+        _dead_dirty += 1
+        save_dead()
 
 
 def yd_to_local(yd_path: str, download_dir: Path) -> Path:
@@ -184,7 +299,10 @@ class YDiskClient:
                 logging.info(f"[RESUME] {dest.name} с {downloaded_size} байт (попытка {attempt + 1})")
 
             try:
-                timeout = aiohttp.ClientTimeout(total=3600, sock_connect=20, sock_read=60)
+                # sock_read=20: мёртвый файл не отдаёт вообще ничего, и ждать
+                # минуту на каждую из двух попыток — это 2 минуты впустую.
+                # Живые файлы идут потоком, таймаут между чанками не мешает.
+                timeout = aiohttp.ClientTimeout(total=3600, sock_connect=20, sock_read=20)
                 written = 0
                 async with self.dl_session.get(href, headers=headers, timeout=timeout) as r:
                     if downloaded_size > 0 and r.status == 200:
@@ -221,7 +339,11 @@ async def fetch_file(disk: YDiskClient, f: Dict[str, Any], download_dir: Path) -
     if dest.exists() and dest.stat().st_size == size:
         return "skipped"
 
-    href = await disk.get_download_link(f["path"])
+    path = f["path"]
+    if is_dead(path):
+        return "dead"
+
+    href = await disk.get_download_link(path)
     if not href:
         raise ValueError("Пустая ссылка на скачивание")
 
@@ -229,10 +351,35 @@ async def fetch_file(disk: YDiskClient, f: Dict[str, Any], download_dir: Path) -
     await disk.download_file(href, dest, size)
     dt = time.time() - t0
 
+    _state["last_ok"] = time.monotonic()
+    clear_dead(path)
+    if size and size <= 5 * 1024 * 1024:
+        # Небольшой успешно скачанный файл — эталон для проверки канала.
+        _state["canary"] = {"path": path, "size": int(size)}
     size_mb = size / 1048576
     speed = size_mb / dt if dt > 0 and size_mb > 0 else 0
     logging.info(f"[OK  ] {f.get('name')} {dt:.1f}s {speed:.1f} MB/s")
     return "ok"
+
+
+async def canary_ok(disk: YDiskClient) -> bool:
+    """Проверка канала: качается ли эталонный файл прямо сейчас."""
+    c = _state.get("canary")
+    if not c:
+        return False
+    try:
+        href = await disk.get_download_link(c["path"])
+        if not href:
+            return False
+        timeout = aiohttp.ClientTimeout(total=25, sock_connect=10, sock_read=15)
+        async with disk.dl_session.get(href, timeout=timeout) as r:
+            if r.status not in (200, 206):
+                return False
+            chunk = await r.content.read(8192)
+            return bool(chunk)
+    except Exception as e:
+        logging.info(f"Канарейка не прошла: {e}")
+        return False
 
 
 async def scan_and_queue(
@@ -307,6 +454,14 @@ async def worker(
         if f is None:
             queue.task_done()
             break
+        # Мёртвые файлы пропускаем мгновенно, до паузы: иначе 200+ таких
+        # файлов съедают по 10 с каждый на пустом месте.
+        if is_dead(f.get("path")):
+            stats["dead"] += 1
+            pbar.update(1)
+            queue.task_done()
+            touch_activity()
+            continue
         # Джентльменская пауза после недавних ошибок: не долбим storage,
         # иначе он начинает подвешивать новые соединения.
         now = time.monotonic()
@@ -319,6 +474,7 @@ async def worker(
         except Exception as e:
             _dl_state["last_fail"] = time.monotonic()
             errors.append((f, str(e)))
+            mark_dead(f.get("path"))
             logging.error(f"[FAIL] {f.get('name')}: {e}")
         finally:
             pbar.update(1)
@@ -358,7 +514,7 @@ async def run_pass() -> Tuple[int, int, int]:
             logging.warning(f"Не удалось получить инфо диска: {e}")
 
         queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=QUEUE_MAXSIZE)
-        stats = {"ok": 0, "skipped": 0}
+        stats = {"ok": 0, "skipped": 0, "dead": 0}
         errors: List[Tuple[Dict, str]] = []
 
         with tqdm(desc="Скачивание", unit="файл") as pbar:
@@ -372,15 +528,20 @@ async def run_pass() -> Tuple[int, int, int]:
             await asyncio.gather(*workers)
 
         final_errors: List[Tuple[Dict, str]] = []
-        if errors:
-            logging.info(f"=== ФИНАЛЬНЫЙ ПОВТОР ({len(errors)} файлов) ===")
-            with tqdm(total=len(errors), desc="Повтор", unit="файл") as pbar:
-                for f, _ in errors:
+        retry_list = [(f, e) for f, e in errors if not is_dead(f.get("path"))]
+        skipped_dead = len(errors) - len(retry_list)
+        if skipped_dead:
+            logging.info(f"Финальный повтор: пропущено {skipped_dead} мёртвых файлов")
+        if retry_list:
+            logging.info(f"=== ФИНАЛЬНЫЙ ПОВТОР ({len(retry_list)} файлов) ===")
+            with tqdm(total=len(retry_list), desc="Повтор", unit="файл") as pbar:
+                for f, _ in retry_list:
                     try:
                         r = await fetch_file(disk, f, download_dir)
                         stats[r] += 1
                     except Exception as e:
                         final_errors.append((f, str(e)))
+                        mark_dead(f.get("path"))
                         logging.error(f"[FAIL] {f.get('name')}: {e}")
                     pbar.update(1)
 
@@ -389,9 +550,21 @@ async def run_pass() -> Tuple[int, int, int]:
                 for f, e in final_errors:
                     logging.error(f"  {f.get('path')}: {e}")
 
-        failed_count = len(final_errors) if errors else 0
+        failed_count = len(final_errors) if retry_list else 0
+        save_dead(force=True)
+        save_canary()
+        # Если проход не дал ни одного файла — проверяем канал эталонным файлом.
+        # Отличаем «эти файлы не отдаются» от «сеть легла».
+        if stats["ok"] == 0 and _dead:
+            if await canary_ok(disk):
+                logging.info("Канарейка прошла: канал жив, мёртвые файлы остаются в кэше")
+            else:
+                removed = purge_unconfirmed()
+                logging.warning(f"Канарейка не прошла: похоже на общий обрыв сети — "
+                                f"снято {removed} неподтверждённых меток")
         logging.info("=" * 60)
-        logging.info(f"ИТОГО: папок={scanned} {stats['ok']} успешно, {stats['skipped']} пропущено, {failed_count} ошибок")
+        logging.info(f"ИТОГО: папок={scanned} {stats['ok']} успешно, {stats['skipped']} пропущено, "
+                     f"{stats['dead']} мёртвых (пропущены из кэша), {failed_count} ошибок")
         return scanned, stats["ok"], failed_count
 
 
@@ -399,6 +572,10 @@ async def main():
     setup_environment()
     log_file = setup_logging()
     logging.info(f"Лог-файл: {log_file}")
+    load_dead()
+    load_canary()
+    if _state.get("canary"):
+        logging.info(f"Эталонный файл для проверки канала: {_state['canary']['path']}")
 
     cfg = load_config()
     delay_min = float(cfg.get("repeat_delay_minutes", 0) or 0)
