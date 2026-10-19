@@ -38,7 +38,30 @@ QUEUE_MAXSIZE = 1000
 # Пауза перед стартом новой загрузки, если недавно была сетевая ошибка
 # (storage Яндекса начинает капать новые соединения при агрессивном потоке).
 COOLDOWN_AFTER_FAIL = 30.0
+# Цикловой режим: максимальная пауза между проходами (2 часа, как договаривались).
+MAX_IDLE_SLEEP = 7200.0
+# Сторож зависаний: если столько минут подряд в проходе не было ни одной попытки,
+# считаем процесс зависшим и выходим — внешний сторож поднимет его заново.
+HANG_TIMEOUT_MINUTES = 20
 _dl_state = {"last_fail": 0.0}
+_state = {"active": False, "last": 0.0}
+
+
+def touch_activity():
+    """Отметка «процесс жив»: любая попытка скачивания или страница скана."""
+    _state["last"] = time.monotonic()
+
+
+async def hang_guard():
+    """Force-exit, если проход замер и внештатно висит без прогресса."""
+    while True:
+        await asyncio.sleep(60)
+        if _state["active"] and (_state["last"] and
+                                 time.monotonic() - _state["last"] > HANG_TIMEOUT_MINUTES * 60):
+            logging.critical(f"Нет активности более {HANG_TIMEOUT_MINUTES} мин — "
+                             f"выходим, чтобы сторож перезапустил процесс")
+            logging.shutdown()
+            os._exit(2)
 
 
 def setup_environment():
@@ -251,6 +274,7 @@ async def scan_and_queue(
 
         results = await asyncio.gather(*[fetch_one(p) for p in batch])
         scanned += len(batch)
+        touch_activity()
         for items in results:
             for it in items:
                 p = it.get("path")
@@ -279,6 +303,7 @@ async def worker(
 ):
     while True:
         _, _, _, f = await queue.get()
+        touch_activity()
         if f is None:
             queue.task_done()
             break
@@ -298,13 +323,11 @@ async def worker(
         finally:
             pbar.update(1)
             queue.task_done()
+            touch_activity()
 
 
-async def main():
-    setup_environment()
-    log_file = setup_logging()
-    logging.info(f"Лог-файл: {log_file}")
-
+async def run_pass() -> Tuple[int, int, int]:
+    """Один проход: скан диска → скачивание → финальный повтор ошибок."""
     cfg = load_config()
     token = cfg.get("token")
     download_dir = Path(cfg.get("download_dir", "./downloads"))
@@ -317,7 +340,6 @@ async def main():
     roots = cfg.get("roots") or ["disk:/"]
     priority = cfg.get("priority") or []
     num_workers = int(cfg.get("workers", CONCURRENT_DOWNLOADS))
-    priority = cfg.get("priority") or []
 
     connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
     dl_connector = aiohttp.TCPConnector(limit=num_workers + 1, ttl_dns_cache=300)
@@ -370,6 +392,54 @@ async def main():
         failed_count = len(final_errors) if errors else 0
         logging.info("=" * 60)
         logging.info(f"ИТОГО: папок={scanned} {stats['ok']} успешно, {stats['skipped']} пропущено, {failed_count} ошибок")
+        return scanned, stats["ok"], failed_count
+
+
+async def main():
+    setup_environment()
+    log_file = setup_logging()
+    logging.info(f"Лог-файл: {log_file}")
+
+    cfg = load_config()
+    delay_min = float(cfg.get("repeat_delay_minutes", 0) or 0)
+
+    if delay_min <= 0:
+        # Однопроходный режим (как раньше): прошли круг и вышли.
+        await run_pass()
+        return
+
+    delay = delay_min * 60
+    logging.info(f"Цикловой режим: пауза между проходами {delay_min:.0f} мин "
+                 f"(с нарастанием до {MAX_IDLE_SLEEP / 60:.0f} мин при пустых проходах)")
+    asyncio.create_task(hang_guard())
+
+    pass_no = 0
+    empty_streak = 0
+    while True:
+        pass_no += 1
+        t0 = time.time()
+        _state["active"] = True
+        touch_activity()
+        try:
+            scanned, ok, failed = await run_pass()
+        except Exception as e:
+            logging.exception(f"[ПРОХОД {pass_no}] аварийно прерван: {e}")
+            scanned = ok = failed = 0
+        finally:
+            _state["active"] = False
+        dur = time.time() - t0
+
+        if ok > 0:
+            empty_streak = 0
+        else:
+            empty_streak += 1
+        # Пустые проходы: ждём дольше, но не бесконечно — небоевые окна переждать.
+        wait = delay * (2 ** (empty_streak - 1)) if empty_streak else delay
+        wait = min(wait, MAX_IDLE_SLEEP)
+
+        logging.info(f"[ПРОХОД {pass_no}] ok={ok} fail={failed} за {dur / 60:.1f} мин; "
+                     f"следующий через {wait / 60:.0f} мин (пустых подряд={empty_streak})")
+        await asyncio.sleep(wait)
 
 
 if __name__ == "__main__":
