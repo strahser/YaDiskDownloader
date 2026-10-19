@@ -47,7 +47,10 @@ foreach ($c in @('config-k1.yaml', 'config-m1.yaml')) {
     }
 
     WLog ($c + ' NOT RUNNING -> restart')
-    Start-Process -FilePath $py -ArgumentList '-u', 'src\main.py', '--config', $c -WorkingDirectory $Repo
+    # -WindowStyle Hidden: без него каждый раннер открывает отдельное видимое окно
+    # консоли, которое легко закрыть случайно — это убивает процесс без трассировки.
+    Start-Process -FilePath $py -ArgumentList '-u', 'src\main.py', '--config', $c `
+                  -WorkingDirectory $Repo -WindowStyle Hidden
     WLog ('restart issued ' + $c)
     $state[$c] = (Get-Date).ToString('s')
 }
