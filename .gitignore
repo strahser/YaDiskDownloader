@@ -3,5 +3,9 @@ __pycache__/
 *.pyc
 logs/
 config.yaml
+# Конфиги раннеров содержат реальные OAuth-токены — в репозиторий не попадают.
+# Образцы — config.example.yaml.
+config-k1.yaml
+config-m1.yaml
 token*
 token*
