@@ -1,5 +1,20 @@
+# Образец общего конфига. Скопируй в config.yaml и подставь свои значения.
+# Сам config.yaml в репозиторий не попадает (.gitignore) — там живёт настоящий токен.
 token: "REPLACE_WITH_YOUR_TOKEN"
 download_dir: "d:\\YandexProjects"
 log_dir: "d:\\Projects\\YaDiskDownloader\\logs"
 chunk_size: 1048576
-max_retries: 5
+max_retries: 2
+workers: 2
+# Пауза между проходами в цикловом режиме (0 = один проход и выход).
+# Пауза удваивается, если проход дал 0 успехов (до 120 минут), и сбрасывается при успехах.
+repeat_delay_minutes: 0
+# Что качать: корни обхода.
+roots:
+  - "disk:/"
+# Папки приоритетом (сначала мелкие файлы из них). Пустой список = без приоритетов.
+priority: []
+# Необязательно: если refresh_token задан, даунлоадер сам освежит токен по Яндекс OAuth.
+refresh_token: "REPLACE_WITH_YOUR_REFRESH_TOKEN"
+client_id: "REPLACE_WITH_APP_CLIENT_ID"
+client_secret: "REPLACE_WITH_APP_CLIENT_SECRET"
