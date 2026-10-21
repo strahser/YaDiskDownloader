@@ -16,7 +16,9 @@ pip install -r requirements.txt
 Скопируй образец конфига и подставь свои значения:
 - один общий конфиг — `config.example.yaml` → `config.yaml`;
 - раннер К1 — `config-k1.example.yaml` → `config-k1.yaml`;
-- раннер М1 — `config-m1.example.yaml` → `config-m1.yaml`.
+- раннер М1 — `config-m1.example.yaml` → `config-m1.yaml`;
+- раннер SSG — `config-ssg.example.yaml` → `config-ssg.yaml` (личный аккаунт
+  `ssg-81@yandex.ru` → `d:\SsgYandexDisk`).
 
 Ключи:
 - `token` — OAuth-токен Яндекс.Диска;
@@ -27,9 +29,9 @@ pip install -r requirements.txt
 - `priority` — папки, которые качаются первыми (внутри них — мелкие файлы);
 - `repeat_delay_minutes` — пауза между проходами в цикловом режиме, `0` = один проход и выход.
 
-> Файлы `config.yaml`, `config-k1.yaml`, `config-m1.yaml` содержат настоящие
-> токены и намеренно не отслеживаются git — в репозитории лежат только
-> `*.example.yaml`. Не добавляй их в индекс случайно (`git add -f`).
+> Файлы `config.yaml`, `config-k1.yaml`, `config-m1.yaml`, `config-ssg.yaml`
+> содержат настоящие токены и намеренно не отслеживаются git — в репозитории
+> лежат только `*.example.yaml`. Не добавляй их в индекс случайно (`git add -f`).
 
 ## Запуск
 
@@ -66,6 +68,7 @@ pip install -r requirements.txt
 ## Сторож
 
 `watchdog.ps1` (задача планировщика `YaDiskWatchdog`, раз в час):
-- держит по одному процессу на конфиг, лишние дубликаты убивает;
+- держит по одному процессу на конфиг (`config-k1.yaml`, `config-m1.yaml`,
+  `config-ssg.yaml`), лишние дубликаты убивает;
 - не перезапускает конфиг чаще, чем раз в 10 минут (защита от цикла);
 - состояние попыток — `logs\watchdog-state.json`, журнал — `logs\watchdog.log`.

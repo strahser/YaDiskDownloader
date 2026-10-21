@@ -9,6 +9,9 @@ $Log = Join-Path $Repo 'logs\watchdog.log'
 $StateFile = Join-Path $Repo 'logs\watchdog-state.json'
 $py = Join-Path $Repo '.venv\Scripts\python.exe'
 $MinRestartGapMin = 10
+# Все раннеры: К1, М1 и SSG (личный аккаунт ssg-81@yandex.ru -> d:\SsgYandexDisk).
+# У каждого — свой config-*.yaml со своим токеном и своей папкой назначения.
+$Configs = @('config-k1.yaml', 'config-m1.yaml', 'config-ssg.yaml')
 function WLog($m) { Add-Content -Path $Log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $m) }
 
 $state = @{}
@@ -21,7 +24,7 @@ if (Test-Path $StateFile) {
     } catch { WLog ('state read failed: ' + $_.Exception.Message) }
 }
 
-foreach ($c in @('config-k1.yaml', 'config-m1.yaml')) {
+foreach ($c in $Configs) {
     $procs = @(Get-WmiObject Win32_Process -ErrorAction SilentlyContinue |
                Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like ('*' + $c + '*') } |
                Sort-Object CreationDate)

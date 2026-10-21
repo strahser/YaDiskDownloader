@@ -1,0 +1,32 @@
+# Образец конфига раннера SSG (личный аккаунт ssg-81@yandex.ru).
+# Скопируй в config-ssg.yaml и подставь свои значения.
+# Сам config-ssg.yaml в репозиторий не попадает (.gitignore) — там живёт настоящий токен.
+token: "REPLACE_WITH_YOUR_TOKEN"
+download_dir: "d:\\SsgYandexDisk"
+log_dir: "D:\\Проекты Симрус\\M1\\YaDiskDownloader\\logs"
+chunk_size: 1048576
+max_retries: 2
+workers: 4
+# Пауза между проходами в цикловом режиме (0 = один проход и выход).
+# Пауза удваивается, если проход дал 0 успехов (до 120 минут), и сбрасывается при успехах.
+repeat_delay_minutes: 10
+# Что качать: корень диска целиком (внутри — папки CIMRUS, ProjectCoding, Проекты 20XX и т.п.).
+roots:
+  - "disk:/"
+# Папки приоритетом: сначала качаются они (и внутри них — мелкие файлы первыми),
+# чтобы гигабайтные «холодные» файлы не блокировали поток.
+priority:
+  - "disk:/Проекты 2014"
+  - "disk:/Проекты 2017"
+  - "disk:/Проекты 2018"
+  - "disk:/Проекты 2020"
+  - "disk:/Проекты 2021"
+  - "disk:/Проекты 2022"
+  - "disk:/Проекты 2023"
+  - "disk:/Проекты 2024"
+  - "disk:/Проекты 2025"
+  - "disk:/Проекты 2026"
+# Необязательно: если refresh_token задан, даунлоадер сам освежит токен по Яндекс OAuth.
+refresh_token: "REPLACE_WITH_YOUR_REFRESH_TOKEN"
+client_id: "REPLACE_WITH_APP_CLIENT_ID"
+client_secret: "REPLACE_WITH_APP_CLIENT_SECRET"
