@@ -43,6 +43,10 @@ COOLDOWN_AFTER_FAIL = 10.0
 # Один такой файл стоит ~40 с (две попытки + пауза), а проходов много — поэтому
 # запоминаем их и пропускаем на DEAD_TTL_HOURS, после чего пробуем снова.
 DEAD_TTL_HOURS = 12.0
+# Таймаут ожидания данных между чанками (сокет). Мёртвый файл отдаёт 0 байт и
+# висит ровно sock_read секунд на каждую попытку — это и есть цена отказа.
+# Для аккаунтов, где много недоступных файлов, делаем его меньше (в конфиге).
+SOCK_READ = 20.0
 # Эталонный (заведомо скачанный) файл: по нему проверяем, жива ли сеть, когда
 # проход не дал ни одного успеха. Если канарейка не проходит — это обрыв сети,
 # и метки «мёртвых» файлов надо снять, иначе просидим на них полдня.
@@ -324,7 +328,7 @@ class YDiskClient:
                 # sock_read=20: мёртвый файл не отдаёт вообще ничего, и ждать
                 # минуту на каждую из двух попыток — это 2 минуты впустую.
                 # Живые файлы идут потоком, таймаут между чанками не мешает.
-                timeout = aiohttp.ClientTimeout(total=3600, sock_connect=20, sock_read=20)
+                timeout = aiohttp.ClientTimeout(total=3600, sock_connect=20, sock_read=SOCK_READ)
                 written = 0
                 async with self.dl_session.get(href, headers=headers, timeout=timeout) as r:
                     if downloaded_size > 0 and r.status == 200:
@@ -520,6 +524,10 @@ async def run_pass() -> Tuple[int, int, int]:
     roots = cfg.get("roots") or ["disk:/"]
     priority = cfg.get("priority") or []
     num_workers = int(cfg.get("workers", CONCURRENT_DOWNLOADS))
+    # Таймаут сокета — из конфига: чем меньше, тем дешевле обход недоступных файлов.
+    global SOCK_READ
+    SOCK_READ = float(cfg.get("sock_read", SOCK_READ) or SOCK_READ)
+    logging.info(f"Воркеров: {num_workers}, таймаут сокета: {SOCK_READ:.0f} с")
 
     connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
     dl_connector = aiohttp.TCPConnector(limit=num_workers + 1, ttl_dns_cache=300)

@@ -14,6 +14,16 @@ $MinRestartGapMin = 10
 $Configs = @('config-k1.yaml', 'config-m1.yaml', 'config-ssg.yaml')
 function WLog($m) { Add-Content -Path $Log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $m) }
 
+# Get-WmiObject отдаёт CreationDate строкой в формате DMTF ("20261022140619.000000+180"),
+# поэтому приводим к DateTime вручную — иначе сравнение с временем файла не работает.
+function ToDate($v) {
+    if ($v -is [datetime]) { return $v }
+    if ($v) {
+        try { return [datetime]::ParseExact($v.Substring(0, 14), 'yyyyMMddHHmmss', $null) } catch { }
+    }
+    return [datetime]::MinValue
+}
+
 $state = @{}
 if (Test-Path $StateFile) {
     try {
@@ -35,6 +45,25 @@ foreach ($c in $Configs) {
             WLog ('killed duplicate ' + $c + ' pid=' + $p.ProcessId)
         }
         $procs = @($procs | Select-Object -First 2)
+    }
+
+    # Конфиг или код изменились позже старта раннера -> перезапуск с новыми
+    # настройками. Иначе правка config-*.yaml осталась бы незамеченной.
+    if ($procs.Count -gt 0) {
+        $oldest = ToDate ($procs | Select-Object -First 1).CreationDate
+        $cfgPath = Join-Path $Repo $c
+        $cfgTime = if (Test-Path $cfgPath) { (Get-Item $cfgPath).LastWriteTime } else { [datetime]::MinValue }
+        $codePath = Join-Path $Repo 'src\main.py'
+        $codeTime = if (Test-Path $codePath) { (Get-Item $codePath).LastWriteTime } else { [datetime]::MinValue }
+        $changed = if ($cfgTime -gt $codeTime) { $cfgTime } else { $codeTime }
+        if ($changed -gt $oldest) {
+            WLog ($c + ' config/code changed (' + $changed.ToString('yyyy-MM-dd HH:mm:ss') + ') -> restart')
+            foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds 2
+            $procs = @()
+            # Перезапуск по правке конфига троттлом не блокируем.
+            $state[$c] = '2000-01-01T00:00:00'
+        }
     }
 
     if ($procs.Count -gt 0) {
