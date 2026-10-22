@@ -224,6 +224,27 @@ def yd_to_local(yd_path: str, download_dir: Path) -> Path:
     return download_dir / Path(*sanitized_parts)
 
 
+def lp(path: Path) -> str:
+    """Строка пути с префиксом \\\\?\\ — для длинных путей (>=260 символов).
+
+    Windows по умолчанию ограничивает путь 260 символами (LongPathsEnabled=0),
+    и API не видит такие файлы: dest.exists() -> False, open() -> WinError 3.
+    С префиксом \\\\?\\ работают и существующие, и только что созданные файлы.
+    """
+    s = str(path)
+    if len(s) >= 260 and not s.startswith("\\\\?\\"):
+        return "\\\\?\\" + s
+    return s
+
+
+def lp_size(path: Path) -> int:
+    """Размер файла (для длинных путей — через lp). -1, если файла нет."""
+    try:
+        return os.stat(lp(path)).st_size
+    except OSError:
+        return -1
+
+
 class YDiskClient:
     def __init__(self, token: str, session: aiohttp.ClientSession, dl_session: aiohttp.ClientSession = None):
         self.token = token
@@ -278,15 +299,16 @@ class YDiskClient:
         return j.get("href", "")
 
     async def download_file(self, href: str, dest: Path, total_size: int) -> bool:
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Для длинных путей (>260 симв.) работаем через префикс \\?\
+        os.makedirs(lp(dest.parent), exist_ok=True)
 
         for attempt in range(MAX_RETRIES):
             # Точку resume пересчитываем КАЖДУЮ попытку: прошлая могла
             # успеть дописать часть файла до обрыва.
             downloaded_size = 0
             mode = "wb"
-            if dest.exists():
-                cur = dest.stat().st_size
+            cur = lp_size(dest)
+            if cur >= 0:
                 if cur == total_size:
                     return True
                 if 0 < cur < total_size:
@@ -313,7 +335,7 @@ class YDiskClient:
                         r.raise_for_status()
 
                     # При повторе после ignore-Range открываем заново в wb
-                    with open(dest, mode) as f:
+                    with open(lp(dest), mode) as f:
                         async for chunk in r.content.iter_chunked(1024 * 1024):
                             f.write(chunk)
                             written += len(chunk)
@@ -336,7 +358,9 @@ async def fetch_file(disk: YDiskClient, f: Dict[str, Any], download_dir: Path) -
     dest = yd_to_local(f["path"], download_dir)
     size = f.get("size") or 0
 
-    if dest.exists() and dest.stat().st_size == size:
+    # lp_size: длинные пути (>260 симв.) обычный Path.stat() не видит —
+    # без этого файл, уже лежащий на диске, считается отсутствующим.
+    if lp_size(dest) == size:
         return "skipped"
 
     path = f["path"]

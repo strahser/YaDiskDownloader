@@ -100,6 +100,17 @@ async def walk(session, sem, root: str) -> list:
     return files
 
 
+def _stat_size(p: Path) -> int:
+    """Размер файла; для путей >=260 симв. — через префикс \\\\?\\ (иначе WinError)."""
+    s = str(p)
+    if len(s) >= 260 and not s.startswith("\\\\?\\"):
+        s = "\\\\?\\" + s
+    try:
+        return os.stat(s).st_size
+    except OSError:
+        return -1
+
+
 def local_index(root: Path) -> dict:
     idx = {}
     if not root.exists():
@@ -108,10 +119,7 @@ def local_index(root: Path) -> dict:
         for f in fn:
             p = Path(dp) / f
             rel = os.path.relpath(p, root).replace('\\', '/')
-            try:
-                idx[rel.lower()] = p.stat().st_size
-            except OSError:
-                idx[rel.lower()] = -1
+            idx[rel.lower()] = _stat_size(p)
     return idx
 
 
