@@ -32,14 +32,14 @@ if ($run.Count -gt 0) {
 }
 
 if ($Foreground) {
-    Write-Host ('Running ' + $Config + ' in this window (Ctrl+C stops the pass)...')
-    & $py -u 'src\main.py' --config $Config
+    Write-Host ('Running ' + $Config + ' in this window, one pass (Ctrl+C stops it)...')
+    & $py -u 'src\main.py' --config $Config --once
     exit $LASTEXITCODE
 }
 
-$p = Start-Process -FilePath $py -ArgumentList '-u', 'src\main.py', '--config', $Config `
+$p = Start-Process -FilePath $py -ArgumentList '-u', 'src\main.py', '--config', $Config, '--once' `
                    -WorkingDirectory $Repo -WindowStyle Hidden -PassThru
-Write-Host ('Started ' + $Config + ' pid=' + $p.Id)
+Write-Host ('Started ' + $Config + ' pid=' + $p.Id + ' (one pass)')
 Start-Sleep -Seconds 3
 $log = Get-ChildItem $logDir -Filter 'download_*.log' -ErrorAction SilentlyContinue |
        Sort-Object LastWriteTime -Descending | Select-Object -First 1

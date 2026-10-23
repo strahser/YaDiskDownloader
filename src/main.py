@@ -31,6 +31,8 @@ def _config_path() -> Path:
 
 
 CONFIG_PATH = _config_path()
+# --once: один проход и выход (для ручных запусков К1/М1 через run-manual.ps1).
+ONCE = "--once" in sys.argv
 LOG_DIR = BASE / "logs"
 API_BASE = "https://cloud-api.yandex.net/v1/disk"
 CONCURRENT_DOWNLOADS = 3
@@ -612,8 +614,10 @@ async def main():
     cfg = load_config()
     delay_min = float(cfg.get("repeat_delay_minutes", 0) or 0)
 
-    if delay_min <= 0:
+    if ONCE or delay_min <= 0:
         # Однопроходный режим (как раньше): прошли круг и вышли.
+        if ONCE and delay_min > 0:
+            logging.info("Ручной режим (--once): один проход, без цикла")
         await run_pass()
         return
 
