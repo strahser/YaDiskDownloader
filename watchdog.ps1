@@ -1,8 +1,10 @@
-# Watchdog for split runners k1/m1: keep exactly one runner pair alive per config.
+# Watchdog for the SSG runner (K1/M1 are started manually, see run-manual.ps1).
 # Guards:
-#   * de-duplicates: if more than 2 python processes match a config, kill the newest extras
+#   * one runner pair per config; extra duplicates are killed
 #   * restart throttle: if a restart was issued < 10 min ago for a config and it is still
 #     dead, skip this cycle (prevents a tight restart loop on a persistently failing config)
+#   * restart on config/code change so edits are applied without manual action
+#   * one-shot stop request: logs\stop-request.txt with config names
 # ASCII-only.
 $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Log = Join-Path $Repo 'logs\watchdog.log'
