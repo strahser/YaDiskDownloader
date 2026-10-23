@@ -9,9 +9,13 @@ $Log = Join-Path $Repo 'logs\watchdog.log'
 $StateFile = Join-Path $Repo 'logs\watchdog-state.json'
 $py = Join-Path $Repo '.venv\Scripts\python.exe'
 $MinRestartGapMin = 10
-# Все раннеры: К1, М1 и SSG (личный аккаунт ssg-81@yandex.ru -> d:\SsgYandexDisk).
-# У каждого — свой config-*.yaml со своим токеном и своей папкой назначения.
-$Configs = @('config-k1.yaml', 'config-m1.yaml', 'config-ssg.yaml')
+# Автозапуск оставлен только для SSG (личный аккаунт ssg-81@yandex.ru -> d:\SsgYandexDisk).
+# К1 и М1 по решению от 22.10.2026 качаются вручную (см. run-manual.ps1):
+# автоперезапуск по кругу только жёг время на недоступных файлах.
+$Configs = @('config-ssg.yaml')
+# Разовый стоп по заявке: logs\stop-request.txt со списком конфигов (по одному в строке).
+# Нужен потому, что раннеры живут в session 0 (S4U) и из интерактивной сессии их не убить.
+$StopFile = Join-Path $Repo 'logs\stop-request.txt'
 function WLog($m) { Add-Content -Path $Log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $m) }
 
 # Get-WmiObject отдаёт CreationDate строкой в формате DMTF ("20261022140619.000000+180"),
@@ -32,6 +36,19 @@ if (Test-Path $StateFile) {
             (ConvertFrom-Json $raw).PSObject.Properties | ForEach-Object { $state[$_.Name] = [string]$_.Value }
         }
     } catch { WLog ('state read failed: ' + $_.Exception.Message) }
+}
+
+if (Test-Path $StopFile) {
+    foreach ($c in @(Get-Content $StopFile -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $rp = @(Get-WmiObject Win32_Process -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like ('*' + $c + '*') })
+        foreach ($p in $rp) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            WLog ('stopped by request ' + $c + ' pid=' + $p.ProcessId)
+        }
+        if ($rp.Count -eq 0) { WLog ('stop request ' + $c + ': nothing running') }
+    }
+    Remove-Item $StopFile -Force -ErrorAction SilentlyContinue
 }
 
 foreach ($c in $Configs) {
