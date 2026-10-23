@@ -57,7 +57,13 @@ pip install -r requirements.txt
 
 # то же, но с прогрессом в текущем окне (Ctrl+C останавливает проход)
 .\run-manual.ps1 -Config config-k1.yaml -Foreground
+
+# забыть кэш «Яндекс не отдаёт» и попробовать эти файлы снова
+.\run-manual.ps1 -Config config-k1.yaml -RetryDead -Wait
 ```
+
+`-RetryDead` переносит `logs\dead_config-<имя>.json` в `.bak-<дата>`: без этого
+файлы, помеченные мёртвыми за последние 12 часов, ручной проход пропускает.
 
 Логи пишутся в `logs\download_YYYYMMDD_HHMMSS.log`.
 

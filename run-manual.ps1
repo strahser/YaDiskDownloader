@@ -6,11 +6,13 @@
 #   .\run-manual.ps1 -Config config-k1.yaml                # background, hidden window
 #   .\run-manual.ps1 -Config config-k1.yaml -Foreground    # current window, live progress
 #   .\run-manual.ps1 -Config config-m1.yaml -Wait          # background + wait for pass end
+#   .\run-manual.ps1 -Config config-k1.yaml -RetryDead     # forget dead cache, retry all
 # ASCII-only.
 param(
     [Parameter(Mandatory = $true)][string]$Config,
     [switch]$Foreground,
-    [switch]$Wait
+    [switch]$Wait,
+    [switch]$RetryDead
 )
 
 $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -29,6 +31,20 @@ $run = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction 
 if ($run.Count -gt 0) {
     Write-Host ('Already running: ' + $Config + ' pid=' + (($run | ForEach-Object { $_.ProcessId }) -join ','))
     exit 0
+}
+
+# -RetryDead: убрать кэш «Яндекс не отдаёт», чтобы проход снова попробовал эти файлы.
+# Иначе они пропускаются 12 часов с момента прошлой неудачи и ручной проход их не тронет.
+if ($RetryDead) {
+    $deadName = 'dead_' + [IO.Path]::GetFileNameWithoutExtension($Config) + '.json'
+    $deadFile = Join-Path $logDir $deadName
+    if (Test-Path $deadFile) {
+        $bak = $deadFile + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+        Move-Item -LiteralPath $deadFile -Destination $bak -Force
+        Write-Host ('Dead cache moved to ' + $bak)
+    } else {
+        Write-Host ('No dead cache: ' + $deadName)
+    }
 }
 
 if ($Foreground) {
