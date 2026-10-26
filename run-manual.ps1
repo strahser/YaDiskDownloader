@@ -57,8 +57,10 @@ $p = Start-Process -FilePath $py -ArgumentList '-u', 'src\main.py', '--config', 
                    -WorkingDirectory $Repo -WindowStyle Hidden -PassThru
 Write-Host ('Started ' + $Config + ' pid=' + $p.Id + ' (one pass)')
 Start-Sleep -Seconds 3
+# CreationTime, не LastWriteTime: у открытого лог-файла Windows «замораживает»
+# дату изменения, и самый свежий по mtime может оказаться чужим (например, SSG).
 $log = Get-ChildItem $logDir -Filter 'download_*.log' -ErrorAction SilentlyContinue |
-       Sort-Object LastWriteTime -Descending | Select-Object -First 1
+       Sort-Object CreationTime -Descending | Select-Object -First 1
 if ($log) { Write-Host ('Log: ' + $log.FullName) }
 
 if ($Wait) {
