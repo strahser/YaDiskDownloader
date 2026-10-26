@@ -40,6 +40,19 @@ if (Test-Path $StateFile) {
     } catch { WLog ('state read failed: ' + $_.Exception.Message) }
 }
 
+# Проверка сети: 23-26.10 SSG потерял 2.5 суток — cloud-api.yandex.net был
+# недоступен, а раннер молча крутил пустые проходы с backoff до 2 часов.
+# Отдельная отметка в журнале делает такие простои видимыми.
+try {
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    $iar = $tcp.BeginConnect('cloud-api.yandex.net', 443, $null, $null)
+    if (-not $iar.AsyncWaitHandle.WaitOne(5000)) { throw 'timeout 5s' }
+    $tcp.EndConnect($iar)
+    $tcp.Close()
+} catch {
+    WLog ('NET DOWN: cloud-api.yandex.net:443 - ' + $_.Exception.Message)
+}
+
 if (Test-Path $StopFile) {
     foreach ($c in @(Get-Content $StopFile -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
         $rp = @(Get-WmiObject Win32_Process -ErrorAction SilentlyContinue |
