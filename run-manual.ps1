@@ -56,12 +56,19 @@ if ($Foreground) {
 $p = Start-Process -FilePath $py -ArgumentList '-u', 'src\main.py', '--config', $Config, '--once' `
                    -WorkingDirectory $Repo -WindowStyle Hidden -PassThru
 Write-Host ('Started ' + $Config + ' pid=' + $p.Id + ' (one pass)')
-Start-Sleep -Seconds 3
+$started = Get-Date
 # CreationTime, не LastWriteTime: у открытого лог-файла Windows «замораживает»
 # дату изменения, и самый свежий по mtime может оказаться чужим (например, SSG).
-$log = Get-ChildItem $logDir -Filter 'download_*.log' -ErrorAction SilentlyContinue |
-       Sort-Object CreationTime -Descending | Select-Object -First 1
+# Ждём именно новый файл (раннер создаёт его с задержкой в несколько секунд).
+$log = $null
+for ($i = 0; $i -lt 15 -and -not $log; $i++) {
+    Start-Sleep -Seconds 2
+    $log = Get-ChildItem $logDir -Filter 'download_*.log' -ErrorAction SilentlyContinue |
+           Where-Object { $_.CreationTime -ge $started } |
+           Sort-Object CreationTime -Descending | Select-Object -First 1
+}
 if ($log) { Write-Host ('Log: ' + $log.FullName) }
+else { Write-Host 'Log: (new log file not found yet, see logs\ for download_*.log)' }
 
 if ($Wait) {
     $p.WaitForExit()
