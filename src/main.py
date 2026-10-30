@@ -418,14 +418,21 @@ async def scan_and_queue(
     workers: int,
     roots: List[str],
     priority: List[str] = None,
+    exclude_dirs: List[str] = None,
 ) -> Tuple[int, int]:
     """BFS-обход: файлы сразу кладутся в очередь на скачивание.
     Приоритет: сначала priority-папки, внутри — мелкие файлы первыми,
     чтобы гигабайтные «холодные» файлы не блокировали поток.
+    exclude_dirs: имена папок (точное совпадение, без учёта регистра),
+    в которые не спускаемся — технический мусор (node_modules, .venv,
+    __pycache__, obj, bin, .git): тысячи мелких файлов, которые Яндекс
+    всё равно не отдаёт (500), а обход их жрёт время и раздувает кэш мёртвых.
     Возвращает (папок_просканировано, файлов_найдено)."""
     pending = list(roots)
     visited = set(roots)
     prio = priority or []
+    excluded = {str(e).lower() for e in (exclude_dirs or []) if str(e).strip()}
+    skipped_dirs = 0
 
     def prio_of(p: str) -> int:
         for pr in prio:
@@ -438,6 +445,8 @@ async def scan_and_queue(
     t0 = time.time()
     logging.info("Сканирование диска (файлы качаются по ходу)...")
     logging.info(f"Корни обхода: {roots}")
+    if excluded:
+        logging.info(f"Исключены папки: {sorted(excluded)}")
     while pending:
         batch = pending[:30]
         pending = pending[30:]
@@ -456,6 +465,9 @@ async def scan_and_queue(
             for it in items:
                 p = it.get("path")
                 if it.get("type") == "dir":
+                    if str(it.get("name") or "").lower() in excluded:
+                        skipped_dirs += 1
+                        continue
                     if p not in visited:
                         visited.add(p)
                         pending.append(p)
@@ -464,7 +476,8 @@ async def scan_and_queue(
                     await queue.put((prio_of(it["path"]), it.get("size") or 0, next(seq), it))
         if scanned % 90 == 0 or not pending:
             logging.info(f"Скан: папок={scanned} файлов_в_работе={found} очередь_папок={len(pending)} {time.time() - t0:.0f}с")
-    logging.info(f"Сканирование готово: папок={scanned} файлов={found} за {time.time() - t0:.0f}с")
+    logging.info(f"Сканирование готово: папок={scanned} файлов={found} за {time.time() - t0:.0f}с"
+                 + (f" (пропущено исключённых папок: {skipped_dirs})" if skipped_dirs else ""))
     for _ in range(workers):
         await queue.put((2 ** 62, 2 ** 62, next(seq), None))
     return scanned, found
@@ -525,6 +538,7 @@ async def run_pass() -> Tuple[int, int, int]:
     download_dir.mkdir(parents=True, exist_ok=True)
     roots = cfg.get("roots") or ["disk:/"]
     priority = cfg.get("priority") or []
+    exclude_dirs = cfg.get("exclude_dirs") or []
     num_workers = int(cfg.get("workers", CONCURRENT_DOWNLOADS))
     # Таймаут сокета — из конфига: чем меньше, тем дешевле обход недоступных файлов.
     global SOCK_READ
@@ -556,7 +570,7 @@ async def run_pass() -> Tuple[int, int, int]:
                 asyncio.create_task(worker(disk, queue, download_dir, stats, errors, pbar))
                 for _ in range(num_workers)
             ]
-            scanned, found = await scan_and_queue(disk, queue, num_workers, roots, priority)
+            scanned, found = await scan_and_queue(disk, queue, num_workers, roots, priority, exclude_dirs)
             pbar.total = found
             pbar.refresh()
             await asyncio.gather(*workers)
